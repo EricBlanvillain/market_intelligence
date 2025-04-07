@@ -98,7 +98,3 @@ The platform offers several interfaces:
 ## License
 
 This project is proprietary and confidential. Unauthorized copying, distribution, or use is strictly prohibited.
-
-## Contact
-
-For questions or support, please contact [your-email@example.com](mailto:your-email@example.com).
