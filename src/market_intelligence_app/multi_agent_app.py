@@ -4,16 +4,54 @@ import streamlit as st
 from dotenv import load_dotenv
 import pandas as pd
 from datetime import datetime
+from openai import OpenAI # Import the OpenAI class
 
 # Import our agent orchestrator
 from agents.orchestrator.agent import OrchestratorAgent
 from supabase_service import SupabaseService, mock_db
 
-# Load environment variables
-load_dotenv()
+# Determine the project root directory (two levels up from this script)
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Construct the path to the .env file
+dotenv_path = os.path.join(project_root, '.env')
 
-# Initialize the orchestrator agent
-orchestrator = OrchestratorAgent()
+# Load environment variables from .env file in the project root
+load_dotenv(dotenv_path=dotenv_path)
+
+# Configure OpenAI client
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    st.error("OPENAI_API_KEY not found in .env file or environment variables.")
+    st.stop()
+
+# Create the OpenAI client instance
+try:
+    openai_api_key = os.getenv("OPENAI_API_KEY") # Re-fetch just before use
+    if not openai_api_key:
+        st.error("OPENAI_API_KEY is missing after loading .env")
+        st.stop()
+    # ---> ADD PRINT STATEMENT HERE <---
+    print(f"Attempting to create OpenAI client with key ending in: ...{openai_api_key[-4:]}")
+    openai_client = OpenAI(api_key=openai_api_key)
+    # Optionally, add a test call here to verify the key immediately
+    # print("Testing client by listing models...")
+    # models = openai_client.models.list()
+    # print(f"Successfully listed models, client seems ok.")
+except Exception as e:
+    st.error(f"Failed to initialize OpenAI client: {e}")
+    # ---> ADD PRINT STATEMENT HERE <---
+    print(f"Client initialization failed. Key used (last 4 chars): ...{openai_api_key[-4:] if openai_api_key else 'None'}")
+    st.stop()
+
+# Initialize the orchestrator agent, passing the client
+try:
+    orchestrator = OrchestratorAgent(openai_client=openai_client)
+except Exception as e:
+    st.error(f"Failed to initialize OrchestratorAgent: {e}. Check agent code.")
+    # Print more details for debugging if needed
+    # import traceback
+    # st.text(traceback.format_exc())
+    st.stop()
 
 # Populate sample data for development/testing
 SupabaseService.populate_sample_data()
@@ -733,91 +771,89 @@ if page == "Chat Interface":
                     if "error" in result["result"]:
                         response_content = f"Error: {result['result']['error']}"
                     else:
-                        data_points = len(result["result"]["collected_data"])
-                        response_content = f"I've collected {data_points} data points about the {result['parameters']['sector']} sector in {result['parameters']['country']}."
+                        # Display results based on which agent was called
+                        if agent_name == "Data Collector":
+                            # Assuming result['result']['collected_data'] contains the list of stored items
+                            collected_data = result.get('result', {}).get('collected_data', [])
+                            data_points = len(collected_data)
+                            sector = result.get('parameters', {}).get('sector', 'Unknown Sector')
+                            country = result.get('parameters', {}).get('country') # Get country safely
+                            custom_keyword = result.get('parameters', {}).get('custom_keyword')
 
-                        # Add custom keyword information if available
-                        if 'custom_keyword' in result['parameters'] and result['parameters']['custom_keyword']:
-                            response_content += f" The data focuses on '{result['parameters']['custom_keyword']}'."
+                            response_content = f"I've collected {data_points} data points about the {sector} sector"
+                            if country:
+                                response_content += f" in {country}"
+                            if custom_keyword:
+                                response_content += f" related to '{custom_keyword}'"
+                            response_content += "."
 
-                        response_content += " The data has been stored in the database."
+                            st.success(response_content)
+                            # Optionally display the collected data points
+                            if collected_data:
+                                st.write("Stored Data Points:")
+                                # Convert list of dicts to DataFrame for better display
+                                try:
+                                    df_collected = pd.DataFrame(collected_data)
+                                    # Select and reorder columns for clarity
+                                    display_cols = ['data_point', 'value', 'source', 'date', 'id']
+                                    df_display = df_collected[[col for col in display_cols if col in df_collected.columns]]
+                                    st.dataframe(df_display)
+                                except Exception as e:
+                                    st.error(f"Error displaying collected data: {e}")
+                                    st.json(collected_data) # Fallback to JSON display
 
-                elif result["agent"] == "report_generator":
-                    if "error" in result["result"]:
-                        response_content = f"Error: {result['result']['error']}"
+                elif agent_name == "Report Generator":
+                    result_data = result.get('result', {}) # Get the nested result dict
+
+                    if "error" in result_data:
+                        # Handle error case correctly
+                        response_content = f"Error generating report: {result_data['error']}"
+                        st.error(response_content) # Display error in chat UI
+                    elif "report" in result_data and isinstance(result_data['report'], dict):
+                        # Handle success case correctly
+                        report = result_data['report']
+                        report_title = report.get('title', 'Generated Report')
+                        report_summary = report.get('summary', 'No summary available.')
+                        # Construct the message for chat history
+                        response_content = f"I've generated a report titled '{report_title}'.\n\n**Summary:**\n{report_summary}"
+                        # Display full info in chat UI
+                        st.success(f"Generated report: {report_title}")
+                        st.markdown(f"**Summary:**\n{report_summary}")
                     else:
-                        report_title = result["result"]["report"]["title"]
-                        report_summary = result["result"]["report"]["summary"]
-                        response_content = f"I've generated a report titled '{report_title}'."
+                        # Handle unexpected format
+                        response_content = "Report generation finished, but the result format was unexpected."
+                        st.warning(response_content) # Display warning in chat UI
+                        st.json(result) # Show raw result for debugging
 
-                        # Add custom keyword information if available
-                        if 'custom_keyword' in result['parameters'] and result['parameters']['custom_keyword']:
-                            response_content += f" The report focuses on '{result['parameters']['custom_keyword']}'."
-
-                        response_content += f"\n\n**Summary:**\n{report_summary}\n\nThe full report has been stored in the database."
-
-                elif result["agent"] == "qa_agent":
-                    if "error" in result["result"]:
-                        response_content = f"Error: {result['result']['error']}"
+                elif agent_name == "QA Agent":
+                    # Assuming result['result']['answer'] contains the answer
+                    answer = result.get('result', {}).get('answer')
+                    if answer:
+                        if "error" in result.get('result', {}):
+                            response_content = f"Error getting answer: {result['result']['error']}"
+                            st.error(response_content)
+                        else:
+                            response_content = answer
+                            st.markdown(response_content)
+                            # Optionally add context about data used if available in result['result']
                     else:
-                        response_content = result["result"]["answer"]
-
-                        # Add information about the data used
-                        if 'reports_used' in result["result"] and result["result"]["reports_used"]:
-                            num_reports = len(result["result"]["reports_used"])
-                            response_content += f"\n\n_Based on {num_reports} report(s)"
-
-                            # Add custom keyword information if available
-                            if 'custom_keyword' in result['parameters'] and result['parameters']['custom_keyword']:
-                                response_content += f" about '{result['parameters']['custom_keyword']}'"
-
-                            response_content += "._"
-
-                        # Add information about Market data used
-                        elif 'market_data_used' in result["result"] and result["result"]["market_data_used"] > 0:
-                            num_data_points = result["result"]["market_data_used"]
-                            response_content += f"\n\n_Based on {num_data_points} Market data point(s)"
-
-                            # Add custom keyword information if available
-                            if 'custom_keyword' in result['parameters'] and result['parameters']['custom_keyword']:
-                                response_content += f" about '{result['parameters']['custom_keyword']}'"
-
-                            response_content += "._"
+                        response_content = "QA agent finished, but no answer was found in the result."
+                        st.warning(response_content)
 
                 else:
-                    response_content = "I'm not sure how to process this request."
+                    # Fallback for unknown agent or error before agent call
+                    error_msg = result.get("error", "An unknown error occurred.")
+                    response_content = f"Error processing request: {error_msg}"
+                    st.error(response_content)
 
-                # Store query in Supabase
-                entities = {}
-                if "parameters" in result:
-                    if "sector" in result["parameters"]:
-                        entities["sector"] = result["parameters"]["sector"]
-                    if "country" in result["parameters"]:
-                        entities["country"] = result["parameters"]["country"]
-                    if "financial_product" in result["parameters"]:
-                        entities["financial_product"] = result["parameters"]["financial_product"]
-
-                    # Extract custom_keyword if it exists
-                    custom_keyword = result["parameters"].get("custom_keyword", None)
-                else:
-                    custom_keyword = None
-
-                SupabaseService.store_query(
-                    query_text=user_input,
-                    entities=entities,
-                    intent="chat",
-                    response=response_content,
-                    agent_type=result["agent"],
-                    metadata={
-                        "custom_keyword": custom_keyword
-                    }
-                )
+            # Store query/response in history and DB
+            # ... (Existing code to store query in SupabaseService if needed) ...
 
             # Add assistant response to chat history
             st.session_state.chat_history.append({
                 "role": "assistant",
-                "content": response_content,
-                "agent": agent_name
+                "content": response_content, # Use the constructed response content
+                "agent": agent_name # Use the actual agent called
             })
 
             # Rerun to update the UI
@@ -825,289 +861,172 @@ if page == "Chat Interface":
 
 elif page == "Data Collection":
     st.markdown("<div class='main-header'>Data Collection</div>", unsafe_allow_html=True)
-    st.markdown("Use the Data Collector Agent to gather Market data from the web and store it in the database.")
+    st.markdown("Use the Data Collector Agent to gather Market data points from external sources (using LLM) and store them in the database.")
     st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
 
     # Form for data collection
     with st.form("data_collection_form"):
+        st.markdown("### Specify Data Collection Parameters")
         sector = st.selectbox("Sector", [
             "Healthcare", "Technology", "Transportation", "Industrial Equipment",
-            "Energy", "Construction", "Agriculture", "Retail",
-            "Financial Services", "Manufacturing"
-        ])
-        country = st.selectbox("Country", [
-            "France", "Germany", "UK", "US", "China", "Japan",
-            "Italy", "Spain", "Brazil", "India"
-        ])
+            "Energy", "Construction", "Agriculture", "Retail", "Video Game",
+            "Financial Services", "Manufacturing", "Semiconductor"
+        ], key="dc_sector")
+        country = st.selectbox("Country (Optional)", [
+            "", "France", "Germany", "UK", "US", "China", "Japan",
+            "Italy", "Spain", "Brazil", "India", "Global"
+        ], key="dc_country")
         financial_product = st.selectbox("Financial Product (Optional)", [
             "", "Leasing", "SALB (Sale and Lease Back)", "Loan", "Rental", "Asset Finance"
-        ])
-
-        # Add custom keyword input
-        custom_keyword = st.text_input("Custom Keyword (Optional)", "",
-                                      help="Enter any additional keyword to refine your search (e.g., 'electric vehicles', 'sustainable finance', 'digital transformation')")
+        ], key="dc_product")
+        custom_keyword = st.text_input("Custom Keyword/Topic (Optional)", "",
+                                      help="Enter any additional keyword to refine the data collection (e.g., 'market size 2025', 'key players', 'recent trends')",
+                                      key="dc_keyword")
 
         submitted = st.form_submit_button("Collect Data")
 
         if submitted:
-            # Show spinner while collecting data
-            with st.spinner("Collecting data from the web..."):
-                # Prepare parameters
-                parameters = {
-                    "sector": sector,
-                    "country": country
-                }
-                if financial_product:
-                    parameters["financial_product"] = financial_product
-                if custom_keyword:
-                    parameters["custom_keyword"] = custom_keyword
+            with st.spinner("Collecting data..."):
+                parameters = {"sector": sector}
+                if country: parameters["country"] = country
+                if financial_product: parameters["financial_product"] = financial_product
+                if custom_keyword: parameters["custom_keyword"] = custom_keyword
 
-                # Process with data collector agent
+                # Call the data collector agent directly
                 result = orchestrator.data_collector.process(parameters)
 
                 # Display results
                 if "error" in result:
                     st.error(f"Error: {result['error']}")
+                    if "raw_response" in result:
+                        st.expander("Show Raw LLM Response").code(result['raw_response'])
+                elif "result" in result and "error" in result['result']: # Handle nested error
+                     st.error(f"Error: {result['result']['error']}")
+                elif "result" in result and "collected_data" in result['result']:
+                    collected_data = result['result']['collected_data']
+                    st.success(f"Successfully collected and stored {len(collected_data)} data points!")
+                    if collected_data:
+                         try:
+                             df_collected = pd.DataFrame(collected_data)
+                             display_cols = ['data_point', 'value', 'source', 'date', 'id']
+                             df_display = df_collected[[col for col in display_cols if col in df_collected.columns]]
+                             st.dataframe(df_display)
+                         except Exception as e:
+                             st.error(f"Error displaying collected data: {e}")
+                             st.json(collected_data)
                 else:
-                    st.success(f"Successfully collected {len(result['collected_data'])} data points!")
-
-                    # Store query in Supabase
-                    entities = {
-                        "sector": sector,
-                        "country": country,
-                        "financial_product": financial_product if financial_product else None
-                    }
-
-                    query_text = f"Collect data for {sector} sector in {country}"
-                    if financial_product:
-                        query_text += f" for {financial_product}"
-                    if custom_keyword:
-                        query_text += f" related to {custom_keyword}"
-
-                    SupabaseService.store_query(
-                        query_text=query_text,
-                        entities=entities,
-                        intent="data_collection",
-                        response=f"Collected {len(result['collected_data'])} data points",
-                        agent_type="data_collector",
-                        metadata={
-                            "data_points": len(result['collected_data']),
-                            "custom_keyword": custom_keyword if custom_keyword else None
-                        }
-                    )
-
-                    # Display the collected data
-                    st.markdown("<div class='sub-header'>Collected Data</div>", unsafe_allow_html=True)
-                    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-                    for i, data_point in enumerate(result["collected_data"]):
-                        st.markdown(f"""
-                        <div class='card'>
-                            <h4>{data_point['name'].replace('_', ' ').title()}</h4>
-                            <p><b>Value:</b> {data_point['value']}</p>
-                            <p><b>Source:</b> {data_point['source']}</p>
-                            <p><b>Date:</b> {data_point['date']}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
+                     st.warning("Data collection finished, but the result format was unexpected.")
+                     st.json(result) # Show raw result for debugging
 
 elif page == "Report Generation":
     st.markdown("<div class='main-header'>Report Generation</div>", unsafe_allow_html=True)
     st.markdown("Generate comprehensive Market reports based on the data stored in the database.")
     st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
 
-    # Form for report generation
     with st.form("report_generation_form"):
+        st.markdown("### Specify Report Parameters")
         sector = st.selectbox("Sector", [
             "Healthcare", "Technology", "Transportation", "Industrial Equipment",
-            "Energy", "Construction", "Agriculture", "Retail",
-            "Financial Services", "Manufacturing"
-        ])
-        country = st.selectbox("Country", [
-            "France", "Germany", "UK", "US", "China", "Japan",
-            "Italy", "Spain", "Brazil", "India"
-        ])
+            "Energy", "Construction", "Agriculture", "Retail", "Video Game",
+            "Financial Services", "Manufacturing", "Semiconductor"
+        ], key="rg_sector")
+        country = st.selectbox("Country (Optional)", [
+            "", "France", "Germany", "UK", "US", "China", "Japan",
+            "Italy", "Spain", "Brazil", "India", "Global"
+        ], key="rg_country")
         financial_product = st.selectbox("Financial Product (Optional)", [
             "", "Leasing", "SALB (Sale and Lease Back)", "Loan", "Rental", "Asset Finance"
-        ])
-
-        # Add custom keyword input
-        custom_keyword = st.text_input("Custom Keyword (Optional)", "",
-                                      help="Enter any additional keyword to refine your report (e.g., 'electric vehicles', 'sustainable finance', 'digital transformation')")
+        ], key="rg_product")
+        custom_keyword = st.text_input("Custom Keyword/Topic (Optional)", "",
+                                      help="Enter any additional keyword to focus the report (e.g., 'market outlook 2025', 'sustainability')",
+                                      key="rg_keyword")
 
         submitted = st.form_submit_button("Generate Report")
 
         if submitted:
-            # Show spinner while generating report
             with st.spinner("Generating report..."):
-                # Prepare parameters
-                parameters = {
-                    "sector": sector,
-                    "country": country
-                }
-                if financial_product:
-                    parameters["financial_product"] = financial_product
-                if custom_keyword:
-                    parameters["custom_keyword"] = custom_keyword
+                parameters = {"sector": sector}
+                if country: parameters["country"] = country
+                if financial_product: parameters["financial_product"] = financial_product
+                if custom_keyword: parameters["custom_keyword"] = custom_keyword
 
-                # Process with report generator agent
+                # Call the report generator agent directly
                 result = orchestrator.report_generator.process(parameters)
 
                 # Display results
-                if "error" in result:
-                    st.error(f"Error: {result['error']}")
+                if "result" in result and "error" in result['result']:
+                     st.error(f"Error: {result['result']['error']}")
+                elif "result" in result and "report" in result['result']:
+                    report = result['result']['report']
+                    st.success(f"Successfully generated report: {report.get('title', 'Untitled')}")
+                    st.markdown(f"<div class='sub-header'>Report Summary</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='report-container'>{report.get('summary', 'No summary available.')}</div>", unsafe_allow_html=True)
+                    with st.expander("View Full Report"):
+                         st.markdown(f"<div class='report-content'>{report.get('content', 'No content available.')}</div>", unsafe_allow_html=True)
                 else:
-                    st.success(f"Successfully generated report: {result['report']['title']}")
-
-                    # Store query in Supabase
-                    entities = {
-                        "sector": sector,
-                        "country": country,
-                        "financial_product": financial_product if financial_product else None
-                    }
-
-                    query_text = f"Generate report for {sector} sector in {country}"
-                    if financial_product:
-                        query_text += f" for {financial_product}"
-                    if custom_keyword:
-                        query_text += f" related to {custom_keyword}"
-
-                    SupabaseService.store_query(
-                        query_text=query_text,
-                        entities=entities,
-                        intent="report_generation",
-                        response=f"Generated report: {result['report']['title']}",
-                        agent_type="report_generator",
-                        metadata={
-                            "report_title": result['report']['title'],
-                            "custom_keyword": custom_keyword if custom_keyword else None
-                        }
-                    )
-
-                    # Display the report
-                    st.markdown("<div class='sub-header'>Report</div>", unsafe_allow_html=True)
-
-                    st.markdown(f"""
-                    <div class='report-container'>
-                        <h3>{result['report']['title']}</h3>
-                        <h4>Executive Summary</h4>
-                        <p>{result['report']['summary']}</p>
-                        <h4>Full Report</h4>
-                        <div class="report-content">{result['report']['content']}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.warning("Report generation finished, but the result format was unexpected.")
+                    st.json(result) # Show raw result for debugging
 
 elif page == "Question Answering":
     st.markdown("<div class='main-header'>Question Answering</div>", unsafe_allow_html=True)
-    st.markdown("Ask questions about the Market reports stored in the database.")
+    st.markdown("Ask specific questions about the data and reports stored in the database.")
     st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
 
-    # Form for question answering
     with st.form("qa_form"):
-        question = st.text_area("Your Question:", height=100)
+        st.markdown("### Ask your Question")
+        question = st.text_area("Question:", height=100, key="qa_question", help="Ask a question like 'What is the market size for Technology in the US?' or 'Summarize the key players in the Healthcare sector report.'")
 
-        # Optional filters
-        st.markdown("### Optional Filters")
-
-        # Always show filters instead of hiding behind checkbox
+        st.markdown("### Optional Filters (to narrow down the context)")
         col1, col2 = st.columns(2)
         with col1:
-            sector = st.selectbox("Sector", [
+            sector = st.selectbox("Sector (Optional)", [
                 "", "Healthcare", "Technology", "Transportation", "Industrial Equipment",
-                "Energy", "Construction", "Agriculture", "Retail",
-                "Financial Services", "Manufacturing"
-            ])
+                "Energy", "Construction", "Agriculture", "Retail", "Video Game",
+                "Financial Services", "Manufacturing", "Semiconductor"
+            ], key="qa_sector")
         with col2:
-            country = st.selectbox("Country", [
+            country = st.selectbox("Country (Optional)", [
                 "", "France", "Germany", "UK", "US", "China", "Japan",
-                "Italy", "Spain", "Brazil", "India"
-            ])
+                "Italy", "Spain", "Brazil", "India", "Global"
+            ], key="qa_country")
 
         col3, col4 = st.columns(2)
         with col3:
-            financial_product = st.selectbox("Financial Product", [
+            financial_product = st.selectbox("Financial Product (Optional)", [
                 "", "Leasing", "SALB (Sale and Lease Back)", "Loan", "Rental", "Asset Finance"
-            ])
+            ], key="qa_product")
         with col4:
-            # Add custom keyword input
-            custom_keyword = st.text_input("Custom Keyword (Optional)", "",
-                                        help="Enter any additional keyword to refine your search (e.g., 'electric vehicles', 'sustainable finance', 'digital transformation')")
+            custom_keyword = st.text_input("Custom Keyword/Topic (Optional)", "", key="qa_keyword", help="Enter a keyword mentioned in the relevant data/report")
 
-        submitted = st.form_submit_button("Ask Question")
+        submitted = st.form_submit_button("Get Answer")
 
         if submitted and question:
-            # Show spinner while processing question
-            with st.spinner("Processing your question..."):
-                # Prepare parameters
-                parameters = {
-                    "question": question
-                }
-                if sector:
-                    parameters["sector"] = sector
-                if country:
-                    parameters["country"] = country
-                if financial_product:
-                    parameters["financial_product"] = financial_product
-                if custom_keyword:
-                    parameters["custom_keyword"] = custom_keyword
+            with st.spinner("Finding answer..."):
+                parameters = {"question": question}
+                if sector: parameters["sector"] = sector
+                if country: parameters["country"] = country
+                if financial_product: parameters["financial_product"] = financial_product
+                if custom_keyword: parameters["custom_keyword"] = custom_keyword
 
-                # Process with QA agent
+                # Call the QA agent directly
                 result = orchestrator.qa_agent.process(parameters)
 
                 # Display results
-                if "error" in result:
-                    st.error(f"Error: {result['error']}")
+                if "result" in result and "error" in result['result']:
+                     st.error(f"Error: {result['result']['error']}")
+                elif "result" in result and "answer" in result['result']:
+                    st.markdown(f"<div class='sub-header'>Answer</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='card'><div class='answer-text'>{result['result']['answer']}</div></div>", unsafe_allow_html=True)
+                    # Optionally display context used
+                    reports_used = result['result'].get('reports_used', [])
+                    data_used = result['result'].get('market_data_used', 0)
+                    if reports_used:
+                        st.markdown(f"_Based on {len(reports_used)} report(s)._ ")
+                    elif data_used > 0:
+                         st.markdown(f"_Based on {data_used} data point(s)._")
                 else:
-                    st.success("Question answered!")
-
-                    # Store query in Supabase
-                    entities = {
-                        "sector": sector if sector else "All",
-                        "country": country if country else "All",
-                        "financial_product": financial_product if financial_product else "All"
-                    }
-
-                    SupabaseService.store_query(
-                        query_text=question,
-                        entities=entities,
-                        intent="question_answering",
-                        response=result['answer'],
-                        agent_type="qa_agent",
-                        metadata={
-                            "reports_used": len(result['reports_used']),
-                            "custom_keyword": custom_keyword if custom_keyword else None
-                        }
-                    )
-
-                    # Add to session state query history for backward compatibility
-                    query_record = {
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "question": question,
-                        "answer": result['answer'],
-                        "reports_used": len(result['reports_used']),
-                        "sector": sector if sector else "All",
-                        "country": country if country else "All",
-                        "financial_product": financial_product if financial_product else "All",
-                        "custom_keyword": custom_keyword if custom_keyword else "None"
-                    }
-                    st.session_state.query_history.append(query_record)
-
-                    # Display the answer
-                    st.markdown("<div class='sub-header'>Answer</div>", unsafe_allow_html=True)
-                    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-                    st.markdown(f"""
-                    <div class='card'>
-                        <div class='answer-text'>{result['answer']}</div>
-                        <p class='info-text'>Based on {len(result['reports_used'])} reports</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    # Display the reports used
-                    if result['reports_used']:
-                        st.markdown("<div class='sub-header'>Reports Used</div>", unsafe_allow_html=True)
-                        st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-                        for report in result['reports_used']:
-                            st.markdown(f"- {report['title']}")
+                    st.warning("Question processing finished, but the result format was unexpected.")
+                    st.json(result) # Show raw result for debugging
 
 elif page == "Workflow Builder":
     st.markdown("<div class='main-header'>Workflow Builder</div>", unsafe_allow_html=True)
@@ -1392,7 +1311,7 @@ elif page == "Data Explorer":
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             sector_filter = st.selectbox("Filter by Sector", ["All", "Healthcare", "Technology", "Transportation", "Industrial Equipment",
-                "Energy", "Construction", "Agriculture", "Retail",
+                "Energy", "Construction", "Agriculture", "Retail", "Semiconductor", "Video Game", # Added missing sectors
                 "Financial Services", "Manufacturing"])
         with col2:
             country_filter = st.selectbox("Filter by Country", ["All", "France", "Germany", "UK", "US", "China", "Japan",

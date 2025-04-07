@@ -167,6 +167,7 @@ class SupabaseService:
 
         # Store in Supabase if available
         supabase_success = False
+        stored_record = None # Initialize variable to hold the result
         supabase_client = SupabaseService.get_client()
         if supabase_client:
             try:
@@ -175,24 +176,28 @@ class SupabaseService:
                     print(f"With custom keyword: {custom_keyword}")
 
                 response = supabase_client.table("market_data").insert(data).execute()
+                # Log the actual response object for detailed inspection
+                print(f"DEBUG: Supabase insert response: {response}")
                 if hasattr(response, 'data') and response.data:
                     print(f"✅ Successfully stored data in Supabase with ID: {record_id}")
                     supabase_success = True
+                    stored_record = response.data[0] # Get the stored record
                 else:
-                    print("❌ Failed to store data in Supabase - no data returned")
+                    print("❌ Failed to store data in Supabase - response did not contain expected data.")
+                    # Log the full response again on failure
+                    print(f"DEBUG: Failing Supabase insert response: {response}")
             except Exception as e:
-                print(f"❌ Error storing data in Supabase: {e}")
+                print(f"❌ Error during Supabase insert operation: {e}")
+                # Optionally re-raise the exception
+                # raise e
         else:
-            print("⚠️ Supabase client not available")
+            print("❌ Supabase client not available. Cannot store data.")
+            # Optionally raise an exception
+            # raise ConnectionError("Supabase client not available.")
 
-        # Only use mock database if Supabase failed or is not available
-        if not supabase_success:
-            print(f"Storing Market data in mock database as fallback: {data_point} for {sector} in {country}")
-            if custom_keyword:
-                print(f"With custom keyword: {custom_keyword}")
-            mock_db["market_data"].append(data)
-
-        return data
+        # Return the data as stored in Supabase (or None if failed)
+        # If returning the input `data` dict is preferred, change this back
+        return stored_record if supabase_success else None
 
     @staticmethod
     def get_market_data(sector=None, country=None, data_point=None, custom_keyword=None, limit=100):
@@ -209,12 +214,9 @@ class SupabaseService:
         Returns:
             list: List of Market data records
         """
-        # Get data from both Supabase and mock database
-        all_data = []
-        supabase_success = False
-
-        # First, try to get data from Supabase if available
+        data = [] # Initialize empty list
         supabase_client = SupabaseService.get_client()
+
         if supabase_client:
             try:
                 print("Retrieving data from Supabase...")
@@ -231,89 +233,36 @@ class SupabaseService:
                     if data_point:
                         query = query.filter("data_point", "eq", data_point)
                     if custom_keyword:
-                        # For custom keyword, use ilike for case-insensitive partial match
-                        # In version 0.7.1, we might need to use a different approach
+                        # For testing: Use exact match (eq) instead of ilike
+                        print(f"DEBUG: Applying EXACT match filter for custom_keyword: {custom_keyword}")
                         try:
-                            query = query.filter("custom_keyword", "ilike", f"%{custom_keyword}%")
+                            # query = query.filter("custom_keyword", "ilike", f"%{custom_keyword}%")
+                            query = query.filter("custom_keyword", "eq", custom_keyword)
                         except Exception as e:
-                            print(f"Warning: Could not apply custom_keyword filter: {e}")
-                            # Fallback to exact match if ilike is not supported
-                            if custom_keyword:
-                                query = query.filter("custom_keyword", "eq", custom_keyword)
+                            print(f"Error applying custom_keyword filter (eq): {e}")
 
                     # Execute the query - in version 0.7.1, limit might be handled differently
                     # or might need to be applied after fetching the data
                     response = query.execute()
 
                     if hasattr(response, 'data') and response.data:
-                        # Apply limit manually if the API doesn't support it
-                        data = response.data[:limit] if len(response.data) > limit else response.data
-                        print(f"✅ Found {len(data)} records in Supabase")
-                        all_data.extend(data)
-                        supabase_success = True
+                        # Apply limit manually if needed (though Supabase client might handle it)
+                        data = response.data[:limit]
+                        print(f"✅ Successfully retrieved {len(data)} records from Supabase.")
                     else:
-                        print("⚠️ No data found in Supabase")
+                        print("⚠️ No data found in Supabase matching the criteria.")
                 except Exception as e:
-                    print(f"❌ Error with query builder: {e}")
-                    # Try a simpler approach as fallback
-                    try:
-                        # Just get all data and filter manually
-                        response = supabase_client.table("market_data").select("*").execute()
-                        if hasattr(response, 'data') and response.data:
-                            # Filter manually
-                            filtered_data = response.data
-                            if sector:
-                                filtered_data = [d for d in filtered_data if d.get("sector") == sector]
-                            if country:
-                                filtered_data = [d for d in filtered_data if d.get("country") == country]
-                            if data_point:
-                                filtered_data = [d for d in filtered_data if d.get("data_point") == data_point]
-                            if custom_keyword:
-                                custom_keyword_lower = custom_keyword.lower()
-                                filtered_data = [d for d in filtered_data if d.get("custom_keyword") and custom_keyword_lower in d.get("custom_keyword", "").lower()]
-
-                            # Apply limit
-                            filtered_data = filtered_data[:limit]
-                            print(f"✅ Found {len(filtered_data)} records in Supabase (manual filtering)")
-                            all_data.extend(filtered_data)
-                            supabase_success = True
-                        else:
-                            print("⚠️ No data found in Supabase")
-                    except Exception as inner_e:
-                        print(f"❌ Error with fallback query: {inner_e}")
+                    print(f"❌ Error retrieving data from Supabase: {e}")
+                    # Optionally raise the exception or return empty list
             except Exception as e:
                 print(f"❌ Error retrieving data from Supabase: {e}")
+                # Optionally raise the exception or return empty list
+        else:
+            print("❌ Supabase client not available. Cannot retrieve data.")
+            # Optionally raise an exception
+            # raise ConnectionError("Supabase client not available.")
 
-        # Only use mock database if Supabase failed or is not available
-        if not supabase_success:
-            print("Retrieving data from mock database as fallback...")
-            filtered_data = mock_db["market_data"]
-
-            # Apply filters
-            if sector:
-                filtered_data = [d for d in filtered_data if d["sector"] == sector]
-            if country:
-                filtered_data = [d for d in filtered_data if d["country"] == country]
-            if data_point:
-                filtered_data = [d for d in filtered_data if d["data_point"] == data_point]
-            if custom_keyword:
-                # Make the custom keyword search case-insensitive
-                custom_keyword_lower = custom_keyword.lower()
-                filtered_data = [d for d in filtered_data if d.get("custom_keyword") and custom_keyword_lower in d.get("custom_keyword", "").lower()]
-
-            print(f"Found {len(filtered_data)} records in mock database")
-            all_data.extend(filtered_data)
-
-        # Remove duplicates based on id
-        unique_ids = set()
-        unique_data = []
-        for item in all_data:
-            if item['id'] not in unique_ids:
-                unique_ids.add(item['id'])
-                unique_data.append(item)
-
-        print(f"Total unique records found: {len(unique_data)}")
-        return unique_data[:limit]
+        return data # Return data retrieved from Supabase (or empty list if failed/none found)
 
     @staticmethod
     def store_report(title, sector, country, financial_product, content, summary=None, metadata=None, custom_keyword=None):

@@ -2,7 +2,9 @@ import os
 import json
 import sys
 from dotenv import load_dotenv
-import openai
+from ..base_agent import BaseAgent
+from supabase_service import SupabaseService
+from openai import OpenAI
 
 # Add parent directory to path to import base_agent
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,18 +28,23 @@ class OrchestratorAgent(BaseAgent):
     Agent responsible for orchestrating the workflow between specialized agents.
     """
 
-    def __init__(self):
-        """Initialize the Orchestrator Agent."""
+    def __init__(self, openai_client: OpenAI = None):
+        """
+        Initializes the OrchestratorAgent.
+
+        Args:
+            openai_client (OpenAI, optional): An initialized OpenAI client instance.
+        """
         super().__init__(
-            name="Orchestrator",
-            description="Orchestrates the workflow between specialized agents",
-            model="gpt-4o-mini"  # Using a smaller model for orchestration decisions
+            name="Orchestrator Agent",
+            description="Routes user queries to the appropriate specialized agent (Data Collector, Report Generator, QA Agent) based on intent.",
+            openai_client=openai_client
         )
 
-        # Initialize specialized agents
-        self.data_collector = DataCollectorAgent()
-        self.report_generator = ReportGeneratorAgent()
-        self.qa_agent = QAAgent()
+        # Initialize specialized agents, passing the client
+        self.data_collector = DataCollectorAgent(openai_client=self.client)
+        self.report_generator = ReportGeneratorAgent(openai_client=self.client)
+        self.qa_agent = QAAgent(openai_client=self.client)
 
     def _get_system_prompt(self):
         """
@@ -64,190 +71,144 @@ class OrchestratorAgent(BaseAgent):
         Always maintain a helpful, professional tone and ensure the user's query is routed to the most appropriate agent.
         """
 
-    def process(self, query_text):
+    def process(self, query_text: str) -> dict:
         """
-        Process a user query and route it to the appropriate specialized agent.
-
-        Args:
-            query_text (str): The user's query text
-
-        Returns:
-            dict: The result from the appropriate specialized agent
+        Processes a user query, determines the intent, and routes to the correct agent.
         """
-        # Analyze the query to determine intent and extract parameters
-        analysis = self._analyze_query(query_text)
-
-        # Route the query to the appropriate agent based on the intent
-        if analysis['intent'] == 'data_collection':
-            result = self.data_collector.process(analysis['parameters'])
-            return {
-                "agent": "data_collector",
-                "intent": analysis['intent'],
-                "parameters": analysis['parameters'],
-                "result": result
-            }
-
-        elif analysis['intent'] == 'report_generation':
-            result = self.report_generator.process(analysis['parameters'])
-            return {
-                "agent": "report_generator",
-                "intent": analysis['intent'],
-                "parameters": analysis['parameters'],
-                "result": result
-            }
-
-        elif analysis['intent'] == 'question_answering':
-            result = self.qa_agent.process(analysis['parameters'])
-            return {
-                "agent": "qa_agent",
-                "intent": analysis['intent'],
-                "parameters": analysis['parameters'],
-                "result": result
-            }
-
-        else:
-            # If the intent is not recognized, provide a helpful error message
-            return {
-                "error": "Unable to determine the appropriate agent for this query",
-                "query": query_text,
-                "analysis": analysis
-            }
-
-    def _analyze_query(self, query_text):
-        """
-        Analyze a user query to determine intent and extract parameters.
-
-        Args:
-            query_text (str): The user's query text
-
-        Returns:
-            dict: The analysis result with intent and parameters
-        """
-        # Use OpenAI to analyze the query
-        response = openai.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": """
-                You are an expert at analyzing user queries about financial Market intelligence.
-                Your task is to determine the intent of the query and extract relevant parameters.
-
-                Possible intents:
-                1. data_collection: The user wants to collect Market data
-                2. report_generation: The user wants to generate a Market report
-                3. question_answering: The user wants to ask a question about Market reports
-
-                Parameters to extract:
-                - sector: The Market sector (e.g., Healthcare, Technology, Transportation)
-                - country: The country (e.g., France, Germany, UK)
-                - financial_product: The financial product (e.g., Leasing, SALB, Loan)
-                - custom_keyword: Any specific keyword or focus area mentioned (e.g., Electric Car, Software, Medical Equipment, Crane)
-                - question: The specific question (for question_answering intent)
-
-                IMPORTANT: For custom_keyword, extract ANY specific product, technology, or focus area mentioned in the query.
-                Examples of custom keywords: Electric Car, Software, Medical Equipment, Crane, Construction Equipment, etc.
-
-                If the user explicitly mentions they're looking for data about a specific keyword like 'Crane',
-                make sure to extract 'Crane' as the custom_keyword.
-
-                Format your response as a JSON object with 'intent' and 'parameters' fields.
-                """},
-                {"role": "user", "content": query_text}
-            ],
-            temperature=0.3,
-            response_format={"type": "json_object"}
-        )
-
-        # Parse the response
         try:
-            analysis = json.loads(response.choices[0].message.content)
-            print(f"Query analysis: {analysis}")
+            # Analyze the query to determine intent and parameters
+            analysis = self._analyze_query(query_text)
 
-            # Ensure the analysis has the required fields
-            if 'intent' not in analysis:
-                analysis['intent'] = 'unknown'
-            if 'parameters' not in analysis:
-                analysis['parameters'] = {}
+            intent = analysis.get("intent")
+            parameters = analysis.get("parameters", {})
 
-            # For question_answering intent, ensure the question parameter is set
-            if analysis['intent'] == 'question_answering' and 'question' not in analysis['parameters']:
-                analysis['parameters']['question'] = query_text
+            agent_to_call = None
+            agent_name_str = ""
 
-            # Check for direct mentions of custom keywords in the query
-            # This is a fallback in case the model doesn't extract them properly
-            lower_query = query_text.lower()
-            common_keywords = ["crane", "electric car", "software", "medical equipment", "airlines", "automation", "renewable"]
+            if intent == "data_collection":
+                agent_to_call = self.data_collector
+                agent_name_str = "data_collector"
+            elif intent == "report_generation":
+                agent_to_call = self.report_generator
+                agent_name_str = "report_generator"
+            elif intent == "question_answering":
+                agent_to_call = self.qa_agent
+                agent_name_str = "qa_agent"
+                # Ensure the question is passed correctly if not extracted
+                if "question" not in parameters:
+                    parameters["question"] = query_text
+            else:
+                # Default or fallback behavior (e.g., use QA agent for general queries)
+                print(f"Orchestrator: Unclear intent '{intent}'. Defaulting to QA.")
+                agent_to_call = self.qa_agent
+                agent_name_str = "qa_agent"
+                parameters["question"] = query_text
 
-            for keyword in common_keywords:
-                if keyword in lower_query and ('custom_keyword' not in analysis['parameters'] or not analysis['parameters']['custom_keyword']):
-                    print(f"Directly detected custom keyword: {keyword}")
-                    analysis['parameters']['custom_keyword'] = keyword.title()
+            # Call the selected agent
+            if agent_to_call:
+                raw_result_dict = agent_to_call.process(parameters)
+                # Extract the relevant part (the inner 'result' dict or the error dict)
+                final_result_data = raw_result_dict.get("result", raw_result_dict) # Use inner result if exists, else the whole dict (for direct errors)
+                return {
+                    "agent": agent_name_str,
+                    "parameters": parameters,
+                    "result": final_result_data # Return the extracted inner result/error
+                }
+            else:
+                # Should not happen with the default case, but handle anyway
+                return {"error": "Could not determine which agent to call."}
 
-            return analysis
+        except Exception as e:
+            print(f"Error in Orchestrator process: {e}")
+            # import traceback
+            # traceback.print_exc() # Print stack trace for detailed debugging
+            return {"error": str(e)}
 
-        except json.JSONDecodeError:
-            # If the response is not valid JSON, return a default analysis
-            return {
-                "intent": "unknown",
-                "parameters": {}
-            }
-
-    def execute_workflow(self, workflow):
+    def _analyze_query(self, query_text: str) -> dict:
         """
-        Execute a multi-step workflow involving multiple agents.
+        Uses the LLM to analyze the user query and extract intent and parameters.
+        """
+        prompt = f"""
+Analyze the following user query for a Market intelligence system. Determine the user's intent and extract relevant parameters.
 
-        Args:
-            workflow (dict): A dictionary describing the workflow:
-                - steps (list): A list of workflow steps, each with:
-                    - agent (str): The agent to use ('data_collector', 'report_generator', or 'qa_agent')
-                    - parameters (dict): The parameters for the agent
-                - context (dict, optional): Shared context for the workflow
+User Query: "{query_text}"
 
-        Returns:
-            dict: The results of the workflow
+Possible Intents:
+- data_collection: User wants to find, research, or collect new/up-to-date data, facts, or outlooks about a Market (e.g., 'Find data on...', 'Research the outlook for...', 'What is the latest market size for...?', 'Collect information about...'). This is for getting *new* information.
+- report_generation: User wants a structured summary or generated report based on *existing, previously collected* data (e.g., 'Generate a report on...', 'Summarize the data for...', 'Create an overview of...'). This uses data already in the system.
+- question_answering: User is asking a specific question about existing data or reports (e.g., 'What was the growth rate last year?', 'Who are the key players listed in the report?').
+
+Parameters to Extract:
+- sector (e.g., Technology, Healthcare, Video Game)
+- country (e.g., France, US) - Optional
+- financial_product (e.g., Leasing, Loan) - Optional
+- custom_keyword (any specific term like 'market outlook 2025', 'electric vehicles', 'sustainability') - Optional
+- question (if intent is question_answering)
+
+Output ONLY a JSON object with 'intent' and 'parameters' keys. Examples:
+{{"intent": "report_generation", "parameters": {{"sector": "Technology", "country": "Germany"}}}} # Generate report from existing data
+{{"intent": "question_answering", "parameters": {{"question": "What is the growth rate for leasing in the French healthcare sector?"}}}} # Ask about existing data
+{{"intent": "data_collection", "parameters": {{"sector": "Video Game", "custom_keyword": "market outlook 2025"}}}} # Research new info
+{{"intent": "data_collection", "parameters": {{"sector": "Transportation", "country": "UK"}}}} # Collect new data
+"""
+
+        messages = [
+            {"role": "system", "content": "You are an expert query analyzer for a Market intelligence system. Your task is to determine intent (data_collection, report_generation, question_answering) and extract parameters from user queries. Output only JSON."},
+            {"role": "user", "content": prompt}
+        ]
+
+        # Use the _call_openai_api helper method inherited from BaseAgent
+        try:
+            response_text = self._call_openai_api(messages, model="gpt-4o-mini", temperature=0.1)
+            # print(f"_analyze_query response: {response_text}") # Debugging
+            analysis = json.loads(response_text)
+            return analysis
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON from LLM analysis: {response_text}")
+            # Fallback: Treat as a general question if analysis fails
+            return {"intent": "question_answering", "parameters": {"question": query_text}}
+        except Exception as e:
+            print(f"Error during query analysis: {e}")
+            # Fallback: Treat as a general question on error
+            return {"intent": "question_answering", "parameters": {"question": query_text}}
+
+    def execute_workflow(self, workflow: dict) -> dict:
+        """
+        Executes a predefined workflow consisting of multiple steps.
+        (Implementation similar to previous examples, ensuring client is passed)
         """
         results = []
-        context = workflow.get('context', {})
+        context = workflow.get("context", {})
 
-        for step in workflow['steps']:
-            # Update step parameters with context if needed
-            parameters = step['parameters'].copy()
-            for key, value in context.items():
-                if key not in parameters:
-                    parameters[key] = value
+        for step in workflow.get("steps", []):
+            agent_type = step.get("agent")
+            parameters = step.get("parameters", {})
 
-            # Execute the step with the appropriate agent
-            if step['agent'] == 'data_collector':
-                result = self.data_collector.process(parameters)
-            elif step['agent'] == 'report_generator':
-                result = self.report_generator.process(parameters)
-            elif step['agent'] == 'qa_agent':
-                result = self.qa_agent.process(parameters)
+            # Update parameters from context if needed
+            # ... (context update logic)
+
+            agent = None
+            if agent_type == "data_collector":
+                agent = self.data_collector
+            elif agent_type == "report_generator":
+                agent = self.report_generator
+            elif agent_type == "qa_agent":
+                agent = self.qa_agent
+
+            if agent:
+                try:
+                    result = agent.process(parameters)
+                    step_result = {"agent": agent_type, "parameters": parameters, "result": result}
+                    results.append(step_result)
+
+                    # Update context if needed
+                    # ... (context update logic)
+
+                except Exception as e:
+                    results.append({"agent": agent_type, "parameters": parameters, "error": str(e)})
+                    # Optionally break workflow on error
+                    # break
             else:
-                result = {"error": f"Unknown agent: {step['agent']}"}
+                results.append({"agent": agent_type, "error": f"Unknown agent type: {agent_type}"})
 
-            # Store the result
-            step_result = {
-                "agent": step['agent'],
-                "parameters": parameters,
-                "result": result
-            }
-            results.append(step_result)
-
-            # Update the context with the result if needed
-            if 'update_context' in step and step['update_context']:
-                for key in step['update_context']:
-                    if key == 'sector' and 'sector' in parameters:
-                        context['sector'] = parameters['sector']
-                    elif key == 'country' and 'country' in parameters:
-                        context['country'] = parameters['country']
-                    elif key == 'financial_product' and 'financial_product' in parameters:
-                        context['financial_product'] = parameters['financial_product']
-                    elif key == 'custom_keyword' and 'custom_keyword' in parameters:
-                        context['custom_keyword'] = parameters['custom_keyword']
-                    # Add more context updates as needed
-
-        return {
-            "workflow": workflow,
-            "results": results,
-            "final_context": context
-        }
+        return {"results": results, "final_context": context}

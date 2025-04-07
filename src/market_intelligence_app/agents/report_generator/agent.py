@@ -2,12 +2,12 @@ import os
 import json
 import sys
 from dotenv import load_dotenv
-import openai
+from ..base_agent import BaseAgent
+from supabase_service import SupabaseService
+from openai import OpenAI
 
 # Add parent directory to path to import base_agent
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from base_agent import BaseAgent
-from supabase_service import SupabaseService
 
 # Load environment variables
 load_dotenv()
@@ -17,13 +17,20 @@ class ReportGeneratorAgent(BaseAgent):
     Agent responsible for generating comprehensive reports based on Market data stored in Supabase.
     """
 
-    def __init__(self):
-        """Initialize the Report Generator Agent."""
+    def __init__(self, openai_client: OpenAI = None):
+        """
+        Initializes the ReportGeneratorAgent.
+
+        Args:
+            openai_client (OpenAI, optional): An initialized OpenAI client instance.
+        """
         super().__init__(
-            name="Report Generator",
-            description="Generates comprehensive Market reports based on stored data",
-            model="gpt-4o"  # Using a more powerful model for report generation
+            name="Report Generator Agent",
+            description="Generates comprehensive Market reports by synthesizing data retrieved from the database.",
+            openai_client=openai_client
         )
+        # Store the desired model for this agent
+        self.model = "gpt-4o" # Or choose a suitable model for report generation
 
     def _get_system_prompt(self):
         """
@@ -48,7 +55,7 @@ class ReportGeneratorAgent(BaseAgent):
         For each section, cite the specific data points used and their sources.
         Use a professional, analytical tone throughout the report.
         Format the report in a clear, structured manner with headings and subheadings.
-        """
+        """ + " Structure the report clearly with sections like Executive Summary, Market Overview, Key Trends, Competitive Landscape, and Conclusion."
 
     def process(self, query):
         """
@@ -63,85 +70,130 @@ class ReportGeneratorAgent(BaseAgent):
         Returns:
             dict: The generated report
         """
-        # Retrieve Market data from Supabase
+        # Get parameters safely
+        sector = query.get('sector')
+        country = query.get('country') # Use .get() for country
+        financial_product = query.get('financial_product')
+        custom_keyword = query.get('custom_keyword')
+
+        if not sector:
+            return {"error": "Sector is required for report generation."}
+        # Removed check requiring country
+
+        # Retrieve Market data from Supabase - Attempt 1 (with custom_keyword)
+        print(f"Attempting to retrieve data for Sector: {sector}, Country: {country}, Keyword: {custom_keyword}")
         market_data = SupabaseService.get_market_data(
-            sector=query['sector'],
-            country=query['country'],
-            custom_keyword=query.get('custom_keyword')
+            sector=sector,
+            country=country, # Pass country (can be None)
+            custom_keyword=custom_keyword # Pass custom_keyword (can be None)
         )
 
+        # Attempt 2 (fallback without custom_keyword if Attempt 1 failed and keyword was present)
+        if not market_data and custom_keyword:
+            print(f"⚠️ No data found with keyword '{custom_keyword}'. Trying fallback without keyword.")
+            market_data = SupabaseService.get_market_data(
+                sector=sector,
+                country=country, # Pass country (can be None)
+                custom_keyword=None # Fallback retrieval
+            )
+
+        # Final check if data exists
         if not market_data:
+            # Ensure the error is nested under 'result' for consistent handling
             return {
-                "error": "No Market data found for the specified parameters",
-                "query": query
+                "query": query,
+                "result": {
+                     "error": "No Market data found for the specified parameters, even after fallback."
+                }
             }
 
         # Format the data for the model
         formatted_data = self._format_data_for_model(market_data)
 
         # Format the query for the model
-        report_title = f"Market Report: {query['sector']} Sector in {query['country']}"
-        if 'financial_product' in query and query['financial_product']:
-            report_title += f" - {query['financial_product']} Products"
-        if 'custom_keyword' in query and query['custom_keyword']:
-            report_title += f" ({query['custom_keyword']})"
+        report_title = f"Market Report: {sector} Sector"
+        if country:
+            report_title += f" in {country}"
+        if financial_product:
+            report_title += f" - {financial_product} Products"
+        if custom_keyword:
+            report_title += f" ({custom_keyword})"
 
-        formatted_query = f"Generate a comprehensive Market report for the {query['sector']} sector in {query['country']}"
-        if 'financial_product' in query and query['financial_product']:
-            formatted_query += f", focusing on {query['financial_product']} products"
-        if 'custom_keyword' in query and query['custom_keyword']:
-            formatted_query += f", with specific emphasis on {query['custom_keyword']}"
+        formatted_query = f"Generate a comprehensive Market report for the {sector} sector"
+        if country:
+            formatted_query += f" in {country}"
+        if financial_product:
+            formatted_query += f", focusing on {financial_product} products"
+        if custom_keyword:
+            formatted_query += f", with specific emphasis on {custom_keyword}"
 
-        # Get response from the model
-        response = openai.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": f"{formatted_query}\n\nHere is the Market data to use:\n\n{formatted_data}"}
-            ],
-            temperature=0.7
-        )
+        # Prepare messages for main report generation
+        report_messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": f"{formatted_query}\n\nHere is the Market data to use:\n\n{formatted_data}"}
+        ]
 
-        report_content = response.choices[0].message.content
+        # Get response using the inherited helper method
+        try:
+            report_content = self._call_openai_api(messages=report_messages, model=self.model, temperature=0.7)
+        except Exception as e:
+            print(f"Error calling OpenAI API for report content: {e}")
+            # Nest the error under 'result' for consistent UI handling
+            return {
+                "query": query,
+                "result": {
+                    "error": f"Failed to generate report content: {e}"
+                }
+            }
 
-        # Generate a summary of the report
-        summary_response = openai.chat.completions.create(
-            model="gpt-4o-mini",  # Using a smaller model for the summary
-            messages=[
-                {"role": "system", "content": "You are an expert at summarizing financial reports. Create a concise executive summary of the following Market report, highlighting the key findings and recommendations."},
-                {"role": "user", "content": report_content}
-            ],
-            temperature=0.5,
-            max_tokens=300
-        )
+        # Prepare messages for summary generation
+        summary_messages = [
+            {"role": "system", "content": "You are an expert at summarizing financial reports. Create a concise executive summary of the following Market report, highlighting the key findings and recommendations."},
+            {"role": "user", "content": report_content}
+        ]
 
-        report_summary = summary_response.choices[0].message.content
+        # Generate a summary using the helper method
+        try:
+            # Using a smaller model for the summary
+            report_summary = self._call_openai_api(messages=summary_messages, model="gpt-4o-mini", temperature=0.5)
+        except Exception as e:
+            print(f"Error calling OpenAI API for report summary: {e}")
+            # Proceed without summary or return error?
+            report_summary = "Error generating summary."
 
         # Prepare metadata
         metadata = {"data_points": len(market_data)}
-        if 'custom_keyword' in query and query['custom_keyword']:
-            metadata['custom_keyword'] = query['custom_keyword']
+        if custom_keyword:
+            metadata['custom_keyword'] = custom_keyword
 
         # Store the report in Supabase
-        financial_product = query.get('financial_product', 'General')
-        stored_report = SupabaseService.store_report(
-            title=report_title,
-            sector=query['sector'],
-            country=query['country'],
-            financial_product=financial_product,
-            content=report_content,
-            summary=report_summary,
-            metadata=metadata
-        )
+        financial_product_to_store = financial_product if financial_product else 'General'
+        try:
+            stored_report = SupabaseService.store_report(
+                title=report_title,
+                sector=sector, # sector is required
+                country=country, # Pass country (can be None)
+                financial_product=financial_product_to_store,
+                content=report_content,
+                summary=report_summary,
+                metadata=metadata,
+                custom_keyword=custom_keyword # Pass custom_keyword (can be None)
+            )
+        except Exception as e:
+            print(f"Error storing report: {e}")
+            stored_report = {"error": f"Failed to store report: {e}"}
 
+        # Return results nested under 'result' key for consistency
         return {
             "query": query,
-            "report": {
-                "title": report_title,
-                "content": report_content,
-                "summary": report_summary
-            },
-            "stored_report": stored_report
+            "result": { # Nest the report details here
+                "report": {
+                    "title": report_title,
+                    "content": report_content,
+                    "summary": report_summary
+                },
+                "stored_report": stored_report # Include storage status/info
+            }
         }
 
     def _format_data_for_model(self, market_data):

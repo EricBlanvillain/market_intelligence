@@ -2,13 +2,13 @@ import os
 import json
 import sys
 from dotenv import load_dotenv
-import openai
+from ..base_agent import BaseAgent
+from supabase_service import SupabaseService
+from openai import OpenAI
 from datetime import datetime
 
 # Add parent directory to path to import base_agent
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from base_agent import BaseAgent
-from supabase_service import SupabaseService
 
 # Load environment variables
 load_dotenv()
@@ -19,13 +19,20 @@ class DataCollectorAgent(BaseAgent):
     Uses the gpt-4o-search-preview model to search the web for up-to-date information.
     """
 
-    def __init__(self):
-        """Initialize the Data Collector Agent."""
+    def __init__(self, openai_client: OpenAI = None):
+        """
+        Initializes the DataCollectorAgent.
+
+        Args:
+            openai_client (OpenAI, optional): An initialized OpenAI client instance.
+        """
         super().__init__(
             name="Data Collector",
             description="Collects Market data from the web and stores it in Supabase",
-            model="gpt-4o"  # Using a standard model since web search is not working correctly
+            openai_client=openai_client
         )
+        # Store the desired model for this agent if needed for API calls
+        self.model = "gpt-4o" # Or whichever model this agent should use
 
     def _get_system_prompt(self):
         """
@@ -69,7 +76,7 @@ class DataCollectorAgent(BaseAgent):
                 "date": "2023"
             }
         ]
-        """
+        """ + " Focus on finding quantifiable data points or key qualitative insights."
 
     def process(self, query):
         """
@@ -85,57 +92,87 @@ class DataCollectorAgent(BaseAgent):
         Returns:
             dict: The collected data
         """
-        # Format the query for the model
-        formatted_query = f"Collect Market data for the {query['sector']} sector in {query['country']}"
-        if 'financial_product' in query and query['financial_product']:
-            formatted_query += f", focusing on {query['financial_product']} products"
-        if 'custom_keyword' in query and query['custom_keyword']:
-            formatted_query += f", with specific emphasis on {query['custom_keyword']}"
-            print(f"Including custom keyword in query: {query['custom_keyword']}")
+        # Get parameters safely
+        sector = query.get('sector')
+        country = query.get('country') # Use .get() for country
+        financial_product = query.get('financial_product')
+        custom_keyword = query.get('custom_keyword')
+
+        if not sector:
+            return {"error": "Sector is required for data collection."}
+        # Removed check requiring country
+
+        # Format query for the model with strict JSON instructions
+        formatted_query = f"""
+Collect key Market data points (e.g., market_size, growth_rate, key_players, market_trends) for the {sector} sector{f' in {country}' if country else ''}{f', focusing on {financial_product} products' if financial_product else ''}{f', specifically regarding {custom_keyword}' if custom_keyword else ''}.
+
+Your response MUST be ONLY a valid JSON list of objects. Each object should represent a data point and have the following keys: "name" (string, e.g., "market_size"), "value" (string), "source" (string, cite your source), and "date" (string, YYYY-MM-DD or year).
+
+DO NOT include any introductory text, explanations, apologies, or markdown formatting like ```json. ONLY output the raw JSON list starting with [ and ending with ].
+
+Example of the exact expected format:
+[
+  {{
+    "name": "market_size",
+    "value": "€5.2 billion",
+    "source": "Example Report 2024",
+    "date": "2024"
+  }},
+  {{
+    "name": "growth_rate",
+    "value": "4.7% CAGR",
+    "source": "Market Analysis Inc.",
+    "date": "2024-01-15"
+  }}
+]
+"""
 
         try:
-            # Get response from the model without web search for now
-            # Web search functionality requires additional setup
-            print(f"Sending query to OpenAI: {formatted_query}")
-            response = openai.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": formatted_query}
-                ],
-                temperature=0.7
-            )
+            # Prepare messages for the API call
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": formatted_query}
+            ]
 
-            # For development/testing, create mock data if the API call fails
-            if not hasattr(response.choices[0].message, 'content') or not response.choices[0].message.content:
+            # Get response using the inherited helper method
+            response_text = self._call_openai_api(messages=messages, model=self.model, temperature=0.1) # Lower temperature might help consistency
+
+            # Attempt to find JSON within potential markdown fences (common LLM mistake)
+            if response_text.strip().startswith("```json"):
+                response_text = response_text.strip()[7:-3].strip()
+            elif response_text.strip().startswith("```"):
+                 response_text = response_text.strip()[3:-3].strip()
+
+            # Check if the response is empty
+            if not response_text:
                 print("⚠️ No content in response, using mock data")
-                current_year = datetime.now().year
-                response_text = json.dumps([
-                    {
-                        "name": "market_size",
-                        "value": f"€5.2 billion for {query['sector']} in {query['country']}",
-                        "source": "Mock Data Source",
-                        "date": f"{current_year}"
-                    },
-                    {
-                        "name": "growth_rate",
-                        "value": "4.7% annual growth",
-                        "source": "Mock Data Source",
-                        "date": f"{current_year}"
-                    }
-                ])
-            else:
-                response_text = response.choices[0].message.content
-                print(f"Response from OpenAI: {response_text[:500]}...")
+                raise ValueError("Received empty response from LLM")
+
+            print(f"Cleaned response from OpenAI: {response_text[:500]}...")
+
+            # Parse the response to extract structured data
+            try:
+                structured_data = json.loads(response_text)
+                if not isinstance(structured_data, list): # Ensure it's a list as requested
+                    print("⚠️ LLM response was valid JSON but not a list. Attempting recovery or using mock data.")
+                    # Handle non-list JSON if possible, or raise error
+                    raise ValueError("LLM returned valid JSON but not the expected list format.")
+            except json.JSONDecodeError as json_err:
+                print(f"Error parsing response: {json_err}")
+                print(f"Invalid JSON received: {response_text}")
+                return {"error": f"Error parsing response from LLM. Invalid JSON received.", "raw_response": response_text}
+            except ValueError as val_err:
+                 # Handle the non-list JSON case
+                 return {"error": str(val_err), "raw_response": response_text}
 
         except Exception as e:
-            print(f"Error calling OpenAI API: {e}")
+            print(f"Error calling OpenAI API or processing response: {e}")
             # Create mock data for development/testing
             current_year = datetime.now().year
             response_text = json.dumps([
                 {
                     "name": "market_size",
-                    "value": f"€5.2 billion for {query['sector']} in {query['country']}",
+                    "value": f"€5.2 billion for {sector} in {country}",
                     "source": "Mock Data Source",
                     "date": f"{current_year}"
                 },
@@ -146,51 +183,31 @@ class DataCollectorAgent(BaseAgent):
                     "date": f"{current_year}"
                 }
             ])
+            return {"error": f"API call or initial processing failed: {e}", "raw_response": response_text}
 
-        # Parse the response to extract structured data
-        print(f"Parsing response...")
-        data_points = self._parse_response(response_text, query['sector'], query['country'])
-        print(f"Parsed {len(data_points)} data points")
-
-        # Prepare metadata with custom keyword if available
-        metadata = {}
-        if 'custom_keyword' in query and query['custom_keyword']:
-            metadata['custom_keyword'] = query['custom_keyword']
-            print(f"Adding custom_keyword to metadata: {query['custom_keyword']}")
-
-        # Store the data points in Supabase
+        # Store the collected data in Supabase
         stored_data = []
-        for data_point in data_points:
-            # Merge metadata with any existing metadata in the data point
-            data_point_metadata = data_point.get('metadata', {})
-            data_point_metadata.update(metadata)
-
-            # Debug print to verify metadata
-            if 'custom_keyword' in data_point_metadata:
-                print(f"Storing data point with custom_keyword in metadata: {data_point_metadata['custom_keyword']}")
-
-            # Ensure custom_keyword is passed directly as well for redundancy
-            custom_keyword = query.get('custom_keyword', None)
-            if not custom_keyword and 'custom_keyword' in data_point_metadata:
-                custom_keyword = data_point_metadata['custom_keyword']
-
-            result = SupabaseService.store_market_data(
-                sector=query['sector'],
-                country=query['country'],
-                data_point=data_point['name'],
-                value=data_point['value'],
-                source=data_point['source'],
-                date=data_point.get('date'),
-                metadata=data_point_metadata,
-                custom_keyword=custom_keyword  # Pass custom_keyword directly
-            )
-            if result:
-                stored_data.append(result)
+        for data_point in structured_data:
+            # Ensure required fields are present
+            if 'name' in data_point and 'value' in data_point:
+                try:
+                    stored_item = SupabaseService.store_market_data(
+                        sector=sector, # sector is required
+                        country=country, # Pass country (can be None)
+                        data_point=data_point['name'],
+                        value=data_point['value'],
+                        source=data_point.get('source', 'LLM Response'),
+                        date=data_point.get('date', datetime.now().strftime("%Y-%m-%d")),
+                        custom_keyword=custom_keyword # Pass custom_keyword (can be None)
+                    )
+                    stored_data.append(stored_item)
+                except Exception as e:
+                    print(f"Error storing data point {data_point.get('name')}: {e}")
+                    # Optionally add error info to results
 
         return {
             "query": query,
-            "collected_data": data_points,
-            "stored_data": stored_data
+            "collected_data": stored_data # Return the successfully stored items
         }
 
     def _parse_response(self, response_text, sector, country):

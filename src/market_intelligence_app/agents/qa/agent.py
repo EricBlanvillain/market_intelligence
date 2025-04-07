@@ -2,7 +2,7 @@ import os
 import json
 import sys
 from dotenv import load_dotenv
-import openai
+from openai import OpenAI
 
 # Add parent directory to path to import base_agent
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,13 +17,20 @@ class QAAgent(BaseAgent):
     Agent responsible for answering questions about Market reports stored in Supabase.
     """
 
-    def __init__(self):
-        """Initialize the QA Agent."""
+    def __init__(self, openai_client: OpenAI = None):
+        """
+        Initializes the QAAgent.
+
+        Args:
+            openai_client (OpenAI, optional): An initialized OpenAI client instance.
+        """
         super().__init__(
             name="QA Agent",
             description="Answers questions about Market reports",
-            model="gpt-4o"  # Using a powerful model for question answering
+            openai_client=openai_client,
         )
+        # Store the desired model for this agent if needed for API calls
+        self.model = "gpt-4o" # Or whichever model this agent should use
 
     def _get_system_prompt(self):
         """
@@ -44,7 +51,7 @@ class QAAgent(BaseAgent):
         5. Provide concise but comprehensive answers
 
         Always maintain the context of equipment financing markets and Market' business focus.
-        """
+        """ + " Base your answers ONLY on the provided context (reports and data). If the answer is not in the context, state that clearly."
 
     def process(self, query):
         """
@@ -62,37 +69,39 @@ class QAAgent(BaseAgent):
         Returns:
             dict: The answer to the question
         """
-        # Retrieve relevant reports from Supabase
-        if 'report_id' in query and query['report_id']:
-            # If a specific report ID is provided, retrieve that report
-            reports = [r for r in SupabaseService.get_reports() if r['id'] == query['report_id']]
-        else:
-            # Otherwise, filter reports based on provided parameters
-            reports = SupabaseService.get_reports(
-                sector=query.get('sector'),
-                country=query.get('country'),
-                financial_product=query.get('financial_product'),
-                custom_keyword=query.get('custom_keyword')
-            )
+        # Get parameters safely
+        question = query.get('question')
+        sector = query.get('sector') # Use .get() for sector
+        country = query.get('country') # Use .get() for country
+        financial_product = query.get('financial_product')
+        custom_keyword = query.get('custom_keyword')
 
-        # Also retrieve relevant Market data
+        if not question:
+            return {"error": "Question is required."}
+
+        # Retrieve relevant reports and data from Supabase based on available filters
+        reports = SupabaseService.get_reports(
+            sector=sector, # Pass potentially None value
+            country=country, # Pass potentially None value
+            financial_product=financial_product, # Pass potentially None value
+            custom_keyword=custom_keyword # Pass potentially None value
+        )
         market_data = SupabaseService.get_market_data(
-            sector=query.get('sector'),
-            country=query.get('country'),
-            data_point=None,  # Get all data points
-            custom_keyword=query.get('custom_keyword')
+            sector=sector, # Pass potentially None value
+            country=country, # Pass potentially None value
+            custom_keyword=custom_keyword # Pass potentially None value
         )
 
         # Debug print to check what data was retrieved
         print(f"Retrieved {len(reports)} reports and {len(market_data)} Market data points")
-        if query.get('custom_keyword'):
-            print(f"Using custom keyword: {query.get('custom_keyword')}")
+        if custom_keyword:
+            print(f"Using custom keyword: {custom_keyword}")
 
         # Check if we have any data to work with
         if not reports and not market_data:
             error_message = "No Market data or reports found for the specified parameters"
-            if query.get('custom_keyword'):
-                error_message += f" '{query.get('custom_keyword')}'"
+            if custom_keyword:
+                error_message += f" '{custom_keyword}'"
             return {
                 "error": error_message,
                 "query": query
@@ -113,36 +122,38 @@ class QAAgent(BaseAgent):
 
         if not context:
             error_message = "No Market data or reports found for the specified parameters"
-            if query.get('custom_keyword'):
-                error_message += f" '{query.get('custom_keyword')}'"
+            if custom_keyword:
+                error_message += f" '{custom_keyword}'"
             return {
                 "error": error_message,
                 "query": query
             }
 
-        # Get response from the model
-        response = openai.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": f"Question: {query['question']}\n\nHere is the relevant Market information:\n\n{context}"}
-            ],
-            temperature=0.7
-        )
+        # Prepare messages for the API call
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": f"Question: {question}\n\nHere is the relevant Market information:\n\n{context}"}
+        ]
 
-        answer = response.choices[0].message.content
+        # Get response using the inherited helper method
+        try:
+            answer = self._call_openai_api(messages=messages, model=self.model, temperature=0.7)
+        except Exception as e:
+            # Handle API call error
+            print(f"Error calling OpenAI API in QAAgent: {e}")
+            return {"error": f"Failed to get answer from LLM: {e}", "query": query}
 
         # Store the query in Supabase
         entities = {
-            "sector": query.get('sector'),
-            "country": query.get('country'),
-            "financial_product": query.get('financial_product'),
-            "custom_keyword": query.get('custom_keyword'),
+            "sector": sector,
+            "country": country,
+            "financial_product": financial_product,
+            "custom_keyword": custom_keyword,
             "report_id": query.get('report_id')
         }
 
         stored_query = SupabaseService.store_query(
-            query_text=query['question'],
+            query_text=question,
             entities=entities,
             intent="question_answering",
             response=answer,
